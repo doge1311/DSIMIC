@@ -1,0 +1,214 @@
+import sys
+import numpy as np
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
+import pyaudio
+import threading
+
+toppreset = [250, 500, 1000, 2000, 4000, 6000, 8000, 11025, 16000, 22050, 32000, 48000]
+
+# Default parameters
+current_sample_rate = 16000
+compress = 2
+
+# PyAudio setup
+p = pyaudio.PyAudio()
+MAIN_SAMPLE_RATE = 96000
+CHANNELS = 1
+CHUNK = 2048
+
+input_stream = None
+output_stream = None
+stop_event = threading.Event()
+
+
+def update_sample_rate(new_rate):
+    """Update the sample rate."""
+    global current_sample_rate
+    current_sample_rate = max(10, new_rate)
+    sample_rate_label.setText(f"Sample Rate: {current_sample_rate} Hz")
+    print(f"Sample rate set to {current_sample_rate} Hz")
+
+
+def update_comp(new_comp):
+    """Update the compression."""
+    global compress
+    compress = new_comp
+    compression_label.setText(f"Compression: {compress}")
+
+
+def create_audio_streams():
+    """Create input and output audio streams."""
+    global input_stream, output_stream
+
+    if input_stream:
+        input_stream.stop_stream()
+        input_stream.close()
+    if output_stream:
+        output_stream.stop_stream()
+        output_stream.close()
+
+    input_stream = p.open(format=pyaudio.paInt16,
+                          channels=CHANNELS,
+                          rate=MAIN_SAMPLE_RATE,
+                          input=True,
+                          frames_per_buffer=CHUNK)
+
+    output_stream = p.open(format=pyaudio.paInt16,
+                           channels=CHANNELS,
+                           rate=MAIN_SAMPLE_RATE,
+                           output=True,
+                           frames_per_buffer=CHUNK)
+
+
+def tsunami_waveform(audio_data):
+    """Apply a 'tsunami' effect to the audio."""
+    tsunami_shape = np.zeros_like(audio_data)
+    for i in range(len(audio_data)):
+        if i % compress == 1:
+            tsunami_shape[i] = audio_data[i] * 0.5  # Amplify rise
+        else:
+            tsunami_shape[i] = audio_data[i] * 1  # Reduce fall
+    return np.clip(tsunami_shape, -32768, 32767)
+
+
+def crop_audio_to_zero_crossing(data):
+    """Crop the audio to the first and last samples closest to zero and going up."""
+    start_index = None
+    end_index = None
+
+    # Find the first and last sample closest to zero and going upward
+    for i in range(1, len(data)):
+        if data[i-1] <= 0 and data[i] > 0:
+            start_index = i
+            break
+
+    for i in range(len(data)-2, -1, -1):
+        if data[i] <= 0 and data[i+1] > 0:
+            end_index = i + 1
+            break
+
+    # Crop the data between start and end indices
+    if start_index is not None and end_index is not None and start_index < end_index:
+        return data[start_index:end_index]
+    else:
+        return data
+
+
+def process_audio():
+    """Process the audio in real-time."""
+    print("Processing audio... Press Ctrl+C to stop.")
+    create_audio_streams()
+
+    while not stop_event.is_set():
+        data = input_stream.read(CHUNK)
+        audio_data = np.frombuffer(data, dtype=np.int16)
+
+        # Downsample
+        low_sample_data = audio_data[::MAIN_SAMPLE_RATE // current_sample_rate]
+
+        # Apply tsunami effect
+        tsunami_data = tsunami_waveform(low_sample_data)
+
+        # Upsample
+        re_up_sample_data = np.repeat(tsunami_data, MAIN_SAMPLE_RATE // current_sample_rate)
+        cropped_data = crop_audio_to_zero_crossing(re_up_sample_data)
+        # Play audio
+        output_data = np.clip(re_up_sample_data, -32767, 32767).astype(np.int16).tobytes()
+        output_stream.write(output_data)
+        # Crop audio to the range between the first and last zero-crossing samples
+
+        update_visualization(cropped_data)
+
+
+def stop_processing():
+    """Stop audio processing."""
+    stop_event.set()
+    if input_stream:
+        input_stream.stop_stream()
+        input_stream.close()
+    if output_stream:
+        output_stream.stop_stream()
+        output_stream.close()
+
+
+def update_visualization(data):
+    """Update the waveform visualization."""
+    waveform_plot.setData(data)
+
+
+# PyQt5 Application
+app = QtWidgets.QApplication([])
+
+# Main Window
+window = QtWidgets.QWidget()
+window.setWindowTitle("Real-Time Audio Processing")
+layout = QtWidgets.QVBoxLayout(window)
+
+# Waveform plot
+plot_widget = pg.PlotWidget()
+waveform_plot = plot_widget.plot([], pen=pg.mkPen(color="blue", width=1))
+plot_widget.setYRange(-32768, 32767)
+layout.addWidget(plot_widget)
+
+# Sample rate label
+sample_rate_label = QtWidgets.QLabel(f"Sample Rate: {current_sample_rate} Hz")
+layout.addWidget(sample_rate_label)
+
+# Sample rate slider
+rate_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+rate_slider.setMinimum(10)
+rate_slider.setMaximum(48000)
+rate_slider.setValue(current_sample_rate)
+rate_slider.setTickInterval(1000)
+rate_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+rate_slider.valueChanged.connect(update_sample_rate)
+layout.addWidget(rate_slider)
+
+# Sample rate preset buttons
+preset_buttons_layout = QtWidgets.QHBoxLayout()
+
+# Define preset rates and corresponding buttons
+preset_rates = toppreset
+for rate in preset_rates:
+    button = QtWidgets.QPushButton(f"{rate} Hz")
+    button.clicked.connect(lambda checked, rate=rate: update_sample_rate(rate))
+    preset_buttons_layout.addWidget(button)
+
+layout.addLayout(preset_buttons_layout)
+
+# Compression label
+compression_label = QtWidgets.QLabel(f"Compression: {compress}")
+layout.addWidget(compression_label)
+
+# Compression slider
+comp_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+comp_slider.setMinimum(1)
+comp_slider.setMaximum(25)
+comp_slider.setValue(compress)
+comp_slider.setTickInterval(1)
+comp_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+comp_slider.valueChanged.connect(update_comp)
+layout.addWidget(comp_slider)
+
+# Start/Stop buttons
+start_button = QtWidgets.QPushButton("Start")
+stop_button = QtWidgets.QPushButton("Stop")
+layout.addWidget(start_button)
+layout.addWidget(stop_button)
+
+
+def start_audio_thread():
+    """Start the audio processing thread."""
+    stop_event.clear()
+    audio_thread = threading.Thread(target=process_audio, daemon=True)
+    audio_thread.start()
+
+
+start_button.clicked.connect(start_audio_thread)
+stop_button.clicked.connect(stop_processing)
+
+# Show window
+window.show()
+app.aboutToQuit.connect(stop_processing)
+sys.exit(app.exec_())
